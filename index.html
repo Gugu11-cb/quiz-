@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>题库刷题</title>
+<!-- 引入强大的 PDF 和 Word 解析库 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--text:#1f2937;--muted:#6b7280;--primary:#2563eb;--ok:#16a34a;--bad:#dc2626;--border:#e5e7eb}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
+header{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--border);padding:10px 12px 0}
+h1{font-size:17px;margin:0 0 8px}
+nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px}
+nav button{white-space:nowrap;border:1px solid var(--border);background:#fff;color:var(--muted);border-radius:999px;padding:6px 10px;font-size:13px}
+nav button.active{background:var(--primary);border-color:var(--primary);color:#fff}
+main{padding:12px;max-width:760px;margin:0 auto;padding-bottom:80px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px}
+h2{font-size:16px;margin:0 0 8px}
+p{line-height:1.6;margin:6px 0}
+button{font:inherit;border:1px solid var(--border);background:#fff;color:var(--text);border-radius:10px;padding:10px 12px;cursor:pointer}
+button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+button.block{display:block;width:100%;margin-top:10px;text-align:center}
+button:disabled{opacity:.5}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.row>button{flex:1;min-width:100px}
+.qtype{display:inline-block;font-size:12px;color:var(--primary);background:#eff6ff;border-radius:999px;padding:2px 8px;margin-bottom:8px}
+.stem{font-size:16px;line-height:1.7;font-weight:600;margin-bottom:12px;white-space:pre-wrap}
+.option{border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0;line-height:1.5;background:#fff}
+.option.active{border-color:var(--primary);background:#eff6ff}
+.hint{font-size:12px;color:var(--muted);margin:6px 0}
+.input{width:100%;border:1px solid var(--border);border-radius:10px;padding:12px;font:inherit;background:#fff;margin:8px 0}
+textarea.input{height:150px;resize:vertical}
+.analysis{border-radius:10px;padding:10px;margin-top:10px;line-height:1.6;white-space:pre-wrap;background:#f9fafb;border:1px solid var(--border)}
+.analysis.ok{background:#f0fdf4;border-color:#bbf7d0}
+.analysis.bad{background:#fef2f2;border-color:#fecaca}
+.progress{font-size:13px;color:var(--muted);margin-bottom:8px}
+.list-item{padding:10px 0;border-bottom:1px solid var(--border)}
+.list-item:last-child{border-bottom:0}
+.small{font-size:13px;color:var(--muted)}
+img.qimg{max-width:100%;border-radius:10px;margin:8px 0}
+#loading-mask{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);color:white;z-index:9999;justify-content:center;align-items:center;flex-direction:column;font-size:16px}
+</style>
+</head>
+<body>
+<div id="loading-mask">正在拼命解析文档，请稍候...</div>
+<header>
+  <h1>题库刷题</h1>
+  <nav>
+    <button data-action="nav" data-view="home">首页</button>
+    <button data-action="nav" data-view="practice">练习</button>
+    <button data-action="nav" data-view="wrong">错题</button>
+    <button data-action="nav" data-view="favorite">收藏</button>
+    <button data-action="nav" data-view="stats">统计</button>
+    <button data-action="nav" data-view="import">导入</button>
+  </nav>
+</header>
+<main id="app"></main>
+<script>
+// 初始化 PDF.js 的 worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+let questions = [];
+let qstate = {};
+let view = 'home';
+let session = null;
+
+const DB_KEY = 'quiz_db_v2';
+const STATE_KEY = 'quiz_state_v1';
+
+function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeAttr(s){ return escapeHtml(s); }
+function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+function typeLabel(t){ return ({single:'单选题',multiple:'多选题',judge:'判断题',fill:'填空题',essay:'问答题'})[t] || t; }
+function normJudge(v){ const s=String(v??'').trim(); if(['T','对','正确','true','TRUE'].includes(s)) return 'T'; if(['F','错','错误','false','FALSE'].includes(s)) return 'F'; return s; }
+
+function getQState(id){ const k = String(id); return qstate[k] || { wrongCount:0, rightCount:0, isFavorite:false }; }
+function saveState(){ localStorage.setItem(STATE_KEY, JSON.stringify(qstate)); }
+function updateQState(id, patch){ const k = String(id); qstate[k] = Object.assign({}, getQState(id), patch, { lastAnsweredAt: Date.now() }); saveState(); }
+function saveDB(){ localStorage.setItem(DB_KEY, JSON.stringify({ version:'local', questions })); }
+function loadDB(){
+  try{
+    const raw = localStorage.getItem(DB_KEY);
+    if(raw){ questions = JSON.parse(raw).questions || []; }
+    else { questions = [{id:1,categoryId:'default',type:'judge',stem:'水的化学式是H2O',answer:'T',analysis:'正确'}] }
+  }catch(e){ questions = []; }
+}
+function loadState(){ try{ qstate = JSON.parse(localStorage.getItem(STATE_KEY) || '{}') || {}; }catch(e){ qstate = {}; } }
+
+function answeredStats(){
+  let answered=0, correct=0, wrong=0;
+  Object.values(qstate).forEach(s => { if(s && (s.isCorrect === true || s.isCorrect === false)){ answered++; if(s.isCorrect) correct++; else wrong++; } });
+  return { answered, correct, wrong, rate: answered ? Math.round(correct/answered*100) : 0 };
+}
+
+function renderHome(){
+  const st = answeredStats();
+  return `<div class="card">
+    <h2>题库概览</h2>
+    <p>共 <b>${questions.length}</b> 道题</p>
+    <p>已答 <b>${st.answered}</b> 题，正确 <b>${st.correct}</b> 题，错误 <b>${st.wrong}</b> 题</p>
+    <p>正确率：<b>${st.rate}%</b></p>
+  </div>
+  <div class="card">
+    <button class="primary block" data-action="start-practice" data-mode="sequence">开始顺序练习</button>
+    <button class="block" data-action="start-practice" data-mode="random">随机练习</button>
+    <button class="block" data-action="start-exam">模拟考试（随机10题）</button>
+    <button class="block" data-action="nav" data-view="import">导入题库 / 设置</button>
+  </div>`;
+}
+
+function startSession(list, mode){
+  if(!list.length){ alert('题库为空，请先导入题库'); return; }
+  session = { mode, list, index:0, answered:false, selected:[], fillInput:'', essayText:'', essaySelf:null, lastResult:null, answers:{}, finished:false };
+  view = mode === 'exam' ? 'exam' : 'practice';
+  render();
+}
+function resetInput(){ session.answered = false; session.selected = []; session.fillInput = ''; session.essayText = ''; session.essaySelf = null; session.lastResult = null; }
+
+function renderQuestionInput(q){
+  if(q.type === 'single' || q.type === 'multiple'){
+    return (q.options || []).map(o => {
+      const active = session.selected.includes(o.label);
+      return `<div class="option ${active?'active':''}" data-action="select" data-label="${escapeAttr(o.label)}"><b>${escapeHtml(o.label)}.</b> ${escapeHtml(o.content)}</div>`;
+    }).join('');
+  }
+  if(q.type === 'judge'){
+    return `<div class="option ${session.selected.includes('T')?'active':''}" data-action="select" data-label="T">对 (正确)</div>
+    <div class="option ${session.selected.includes('F')?'active':''}" data-action="select" data-label="F">错 (错误)</div>`;
+  }
+  if(q.type === 'fill'){
+    return `<div class="hint">多个空用 ; 分隔</div><input id="fill-input" class="input" value="${escapeAttr(session.fillInput)}" placeholder="输入答案">`;
+  }
+  if(q.type === 'essay'){
+    return `<textarea id="essay-input" class="input" rows="5" placeholder="输入你的答案">${escapeHtml(session.essayText)}</textarea>
+    <div class="row"><button data-action="essay-self" data-value="right" class="${session.essaySelf==='right'?'primary':''}">掌握</button><button data-action="essay-self" data-value="wrong" class="${session.essaySelf==='wrong'?'primary':''}">未掌握</button></div>`;
+  }
+  return '';
+}
+
+function correctAnswerText(q){
+  if(q.type === 'judge') return normJudge(q.answer) === 'T' ? '对' : '错';
+  if(q.type === 'fill'){ let a = q.answer; if(!Array.isArray(a)){ try{ a = JSON.parse(q.answer || '[]'); }catch(e){ a = String(q.answer || '').split(';'); } } return Array.isArray(a) ? a.join('；') : String(q.answer || ''); }
+  return String(q.answer || '');
+}
+
+function renderResult(q, result){
+  return `<div class="analysis ${result.isCorrect?'ok':'bad'}">${result.isCorrect?'回答正确':'回答错误'}</div>
+  <div class="analysis"><b>正确答案：</b>${escapeHtml(correctAnswerText(q))}</div>
+  ${q.analysis ? `<div class="analysis"><b>解析：</b>${escapeHtml(q.analysis)}</div>` : ''}`;
+}
+
+function renderPractice(){
+  if(!session || session.mode !== 'practice') return `<div class="card"><h2>练习</h2><button class="primary block" data-action="start-practice" data-mode="sequence">顺序练习</button><button class="block" data-action="start-practice" data-mode="random">随机练习</button></div>`;
+  if(session.finished) return `<div class="card"><h2>练习完成</h2><button class="primary block" data-action="back-home">返回首页</button></div>`;
+  const q = session.list[session.index]; const st = getQState(q.id);
+  let html = `<div class="card"><div class="progress">第 ${session.index+1} / ${session.list.length} 题</div><div class="qtype">${typeLabel(q.type)}</div><div class="stem">${escapeHtml(q.stem)}</div>${renderQuestionInput(q)}`;
+  if(session.answered){ html += renderResult(q, session.lastResult); html += `<div class="row"><button data-action="prev" ${session.index===0?'disabled':''}>上一题</button><button class="primary" data-action="next">${session.index>=session.list.length-1?'完成':'下一题'}</button></div>`; }
+  else{ html += `<button class="primary block" data-action="submit">提交答案</button>`; }
+  html += `<div class="row"><button data-action="toggle-fav">${st.isFavorite?'取消收藏':'收藏本题'}</button><button data-action="back-home">返回首页</button></div></div>`;
+  return html;
+}
+
+function renderWrong(){
+  const list = questions.filter(q => getQState(q.id).isCorrect === false);
+  return `<div class="card"><h2>错题本</h2>${list.length ? list.map(q => `<div class="list-item"><div>${escapeHtml(q.stem.slice(0,60))}...</div><div class="row"><button data-action="practice-one" data-id="${escapeAttr(q.id)}">练习此题</button></div></div>`).join('') : '<p class="small">暂无错题。</p>'}</div>`;
+}
+function renderFavorite(){
+  const list = questions.filter(q => getQState(q.id).isFavorite);
+  return `<div class="card"><h2>收藏</h2>${list.length ? list.map(q => `<div class="list-item"><div>${escapeHtml(q.stem.slice(0,60))}...</div><div class="row"><button data-action="practice-one" data-id="${escapeAttr(q.id)}">练习此题</button></div></div>`).join('') : '<p class="small">暂无收藏。</p>'}</div>`;
+}
+function renderStats(){
+  const st = answeredStats();
+  return `<div class="card"><h2>统计</h2><p>总题数：${questions.length}</p><p>已答：${st.answered}，正确率：${st.rate}%</p><p>错题本：${questions.filter(q => getQState(q.id).isCorrect === false).length} 题</p></div>`;
+}
+
+function renderImport(){
+  return `<div class="card"><h2>📁 上传文档导入</h2>
+    <p class="small">支持 .txt, .pdf, .docx (WPS请另存为docx或txt)。解析需要几秒钟，请耐心等待。</p>
+    <input type="file" id="file-upload" accept=".txt,.pdf,.docx" style="margin:10px 0; display:block; width:100%;">
+  </div>
+  <div class="card"><h2>📋 纯文本粘贴导入</h2>
+    <p class="small">或者直接把文字粘贴到下面，点击解析。</p>
+    <textarea id="paste-text" class="input" placeholder="在此粘贴文字..."></textarea>
+    <button class="primary block" data-action="do-parse">一键解析并导入</button>
+  </div>
+  <div class="card"><h2>题库格式规范</h2>
+    <p class="small">题号后跟“判断题/单选题/多选题/填空题/问答题”。<br>判断题只要有“对/错”即可。<br>单选多选选项以 A、B、C、D 开头。</p>
+    <div class="row"><button data-action="clear-progress">清空答题记录</button></div>
+  </div>`;
+}
+
+function grade(q, selected, fillInput, essaySelf, essayText){
+  const type = q.type;
+  if(type === 'single'){ const ua = (selected || [])[0] || ''; return { userAnswer: ua, isCorrect: ua === String(q.answer || '').trim() }; }
+  if(type === 'multiple'){ const ua = (selected || []).slice().sort().join(','); const ans = String(q.answer || '').split(',').map(s=>s.trim()).sort().join(','); return { userAnswer: ua, isCorrect: ua === ans }; }
+  if(type === 'judge'){ const ua = (selected || [])[0] || ''; return { userAnswer: ua, isCorrect: ua === normJudge(q.answer) }; }
+  if(type === 'fill'){ const inputs = String(fillInput || '').split(';').map(s => s.trim()).filter(s => s !== ''); let corrects = []; if(Array.isArray(q.answer)){ corrects = q.answer; }else{ try{ corrects = JSON.parse(q.answer || '[]'); }catch(e){ corrects = String(q.answer || '').split(';'); } } if(!Array.isArray(corrects)) corrects = [String(corrects)]; if(inputs.length !== corrects.length) return { userAnswer: JSON.stringify(inputs), isCorrect: false }; let ok = true; for(let i=0;i<corrects.length;i++){ const accepts = String(corrects[i]).split('|').map(s => s.trim().toLowerCase()); if(!accepts.includes(inputs[i].toLowerCase())) ok = false; } return { userAnswer: JSON.stringify(inputs), isCorrect: ok }; }
+  if(type === 'essay'){ return { userAnswer: String(essayText || ''), isCorrect: essaySelf === 'right' }; }
+  return { userAnswer: '', isCorrect: false };
+}
+
+function submitPractice(){
+  if(!session || session.mode !== 'practice') return;
+  const q = session.list[session.index];
+  if(q.type === 'essay' && !session.essaySelf){ alert('请先选择掌握/未掌握'); return; }
+  const result = grade(q, session.selected, session.fillInput, session.essaySelf, session.essayText);
+  const st = getQState(q.id);
+  updateQState(q.id, { lastAnswer: result.userAnswer, isCorrect: result.isCorrect, wrongCount: (st.wrongCount || 0) + (result.isCorrect ? 0 : 1), rightCount: (st.rightCount || 0) + (result.isCorrect ? 1 : 0) });
+  session.answered = true; session.lastResult = result; render();
+}
+
+function renderExam(){
+  if(!session || session.mode !== 'exam') return `<div class="card"><h2>模拟考试</h2><button class="primary block" data-action="start-exam">开始模拟考试</button></div>`;
+  if(session.finished){
+    let correct = 0; session.list.forEach(q => { const r = session.answers[q.id]; if(r && r.isCorrect) correct++; });
+    const score = session.list.length ? Math.round(correct / session.list.length * 100) : 0;
+    return `<div class="card"><h2>考试结果</h2><p>得分：<b>${score}</b> 分</p><button class="primary block" data-action="back-home">返回首页</button></div>`;
+  }
+  const q = session.list[session.index];
+  return `<div class="card"><div class="progress">考试 第 ${session.index+1} / ${session.list.length} 题</div><div class="qtype">${typeLabel(q.type)}</div><div class="stem">${escapeHtml(q.stem)}</div>${renderQuestionInput(q)}<button class="primary block" data-action="exam-submit">提交并下一题</button><button class="block" data-action="back-home">退出考试</button></div>`;
+}
+
+function submitExam(){
+  if(!session || session.mode !== 'exam') return;
+  const q = session.list[session.index];
+  session.answers[q.id] = grade(q, session.selected, session.fillInput, session.essaySelf, session.essayText);
+  if(session.index >= session.list.length - 1){ session.finished = true; }else{ session.index++; resetInput(); }
+  render();
+}
+
+// ===== 核心：文本解析逻辑 =====
+function parsePastedText(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+  const newQuestions = [];
+  let currentQ = null;
+
+  const qTypeRegex = /^\d+[\.\、]\s*(判断题|单选题|多选题|填空题|问答题)[\s:：]*(.*)/;
+
+  lines.forEach(line => {
+    const match = line.match(qTypeRegex);
+    if (match) {
+      if (currentQ) newQuestions.push(currentQ);
+      const typeText = match[1];
+      let type = 'single';
+      if (typeText === '判断题') type = 'judge';
+      if (typeText === '多选题') type = 'multiple';
+      if (typeText === '填空题') type = 'fill';
+      if (typeText === '问答题') type = 'essay';
+
+      currentQ = {
+        id: newQuestions.length + 1,
+        type: type,
+        stem: match[2] || '',
+        options: [],
+        answer: '',
+        analysis: ''
+      };
+    } else if (currentQ) {
+      const optMatch = line.match(/^([A-E])[\s\.\、\:：]+(.*)/);
+      if (optMatch && (currentQ.type === 'single' || currentQ.type === 'multiple')) {
+        currentQ.options.push({ label: optMatch[1], content: optMatch[2] });
+      } else {
+        if (currentQ.type === 'judge' && (line === '对' || line === '错' || line === '正确' || line === '错误')) {
+           // 忽略判断选项
+        } else {
+          currentQ.stem += '\n' + line;
+        }
+      }
+    }
+  });
+  if (currentQ) newQuestions.push(currentQ);
+  return newQuestions;
+}
+
+function render(){
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  const app = document.getElementById('app');
+  if(view === 'home') app.innerHTML = renderHome();
+  else if(view === 'practice') app.innerHTML = renderPractice();
+  else if(view === 'wrong') app.innerHTML = renderWrong();
+  else if(view === 'favorite') app.innerHTML = renderFavorite();
+  else if(view === 'stats') app.innerHTML = renderStats();
+  else if(view === 'import') app.innerHTML = renderImport();
+  else if(view === 'exam') app.innerHTML = renderExam();
+}
+
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-action]'); if(!el) return;
+  const action = el.dataset.action;
+
+  if(action === 'nav'){ view = el.dataset.view; render(); return; }
+  if(action === 'start-practice'){ const mode = el.dataset.mode; const list = questions.slice(); if(mode === 'random') shuffle(list); startSession(list, 'practice'); return; }
+  if(action === 'start-exam'){ const list = shuffle(questions.slice()).slice(0, Math.min(10, questions.length)); startSession(list, 'exam'); return; }
+  if(action === 'select'){
+    if(!session) return;
+    const label = el.dataset.label; const q = session.list[session.index];
+    if(q.type === 'multiple'){ const i = session.selected.indexOf(label); if(i >= 0) session.selected.splice(i,1); else session.selected.push(label); }
+    else{ session.selected = [label]; }
+    render(); return;
+  }
+  if(action === 'essay-self'){ if(!session) return; session.essaySelf = el.dataset.value; render(); return; }
+  if(action === 'submit'){ submitPractice(); return; }
+  if(action === 'exam-submit'){ submitExam(); return; }
+  if(action === 'next'){ if(!session) return; if(session.index >= session.list.length - 1){ session.finished = true; view = 'practice'; render(); }else{ session.index++; resetInput(); render(); } return; }
+  if(action === 'prev'){ if(!session) return; if(session.index > 0){ session.index--; resetInput(); render(); } return; }
+  if(action === 'toggle-fav'){ if(!session) return; const q = session.list[session.index]; const st = getQState(q.id); updateQState(q.id, { isFavorite: !st.isFavorite }); render(); return; }
+  if(action === 'practice-one'){ const id = el.dataset.id; const q = questions.find(x => String(x.id) === String(id)); if(q) startSession([q], 'practice'); return; }
+  if(action === 'back-home'){ view = 'home'; session = null; render(); return; }
+  if(action === 'clear-progress'){ if(confirm('确定清空所有答题进度、错题和收藏吗？')){ qstate = {}; saveState(); render(); } return; }
+  
+  if(action === 'do-parse'){
+    const txt = document.getElementById('paste-text').value;
+    if(!txt) { alert('请先粘贴文字内容'); return; }
+    const parsed = parsePastedText(txt);
+    if(parsed.length === 0) { alert('没有识别出题目，请检查文字格式。'); return; }
+    questions = parsed;
+    saveDB();
+    alert(`成功识别并导入 ${parsed.length} 道题！`);
+    view = 'home';
+    render();
+    return;
+  }
+});
+
+document.addEventListener('input', e => { if(!session) return; if(e.target.id === 'fill-input') session.fillInput = e.target.value; if(e.target.id === 'essay-input') session.essayText = e.target.value; });
+
+// ===== 文件上传解析核心逻辑 =====
+document.addEventListener('change', async e => {
+  if(e.target.id !== 'file-upload') return;
+  const f = e.target.files[0];
+  if(!f) return;
+
+  const fileExt = f.name.split('.').pop().toLowerCase();
+  const loadingMask = document.getElementById('loading-mask');
+  loadingMask.style.display = 'flex';
+
+  try {
+    let text = '';
+    if (fileExt === 'txt') {
+      text = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsText(f, 'UTF-8');
+      });
+    } else if (fileExt === 'docx') {
+      const arrayBuffer = await f.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer: arrayBuffer });
+      text = result.value;
+    } else if (fileExt === 'pdf') {
+      const arrayBuffer = await f.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      let pagesText = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => item.str).join(' ');
+        pagesText.push(pageText);
+      }
+      text = pagesText.join('\n');
+    } else {
+      alert('不支持的文件格式，请上传 txt, pdf 或 docx 文件！');
+      loadingMask.style.display = 'none';
+      return;
+    }
+
+    const parsed = parsePastedText(text);
+    if(parsed.length === 0) { alert('解析失败：未能从文档中识别出题目，请检查文档排版。'); }
+    else {
+      questions = parsed;
+      saveDB();
+      alert(`成功从文档中解析并导入了 ${parsed.length} 道题！`);
+      view = 'home';
+      render();
+    }
+  } catch (error) {
+    console.error(error);
+    alert('解析文件时出错：' + error.message);
+  } finally {
+    loadingMask.style.display = 'none';
+    e.target.value = ''; // 清空 input
+  }
+});
+
+loadDB(); loadState(); render();
+</script>
+</body>
+</html>
